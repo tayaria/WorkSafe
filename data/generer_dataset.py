@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Générateur de dataset synthétique WorkSafe v2 (objectif 1 : détection d'anomalie).
+Générateur de dataset synthétique WorkSafe v2.
+  - dataset_train / val / test     : détection d'anomalie (autoencoder)
+  - dataset_cnn_train / cnn_val / cnn_test : classification du type (CNN 1D),
+    avec de nouveaux athlètes et une colonne supplémentaire session_type
+  - dataset_cnn_test2 : confirmation finale du prototype (10 nouveaux athlètes,
+    générateur séparé graine + 2, jamais utilisé pour décider)
 
 Les 9 premières colonnes reproduisent EXACTEMENT le log CSV de l'ESP32 (50 Hz) :
     temps_ms, ax_tibia, ay_tibia, az_tibia, gy_tibia, gy_cuisse,
@@ -13,6 +18,7 @@ Hypothèses sur les axes du MPU du tibia (à adapter à ton montage) :
 
 Usage :  python3 generer_dataset.py [dossier_sortie] [graine]
 """
+import itertools
 import sys
 import numpy as np
 import pandas as pd
@@ -34,6 +40,33 @@ S_FAT_CAD = (0.10, 0.20)
 BASE_STRIDES = 100
 
 TYPES = ["instabilite", "faux_pas", "hyperextension", "boiterie"]
+
+# Jeux CNN : nombre d'athlètes (nouveaux, ids à partir de 27) par fichier
+CNN_ATHLETES = {"cnn_train": 20, "cnn_val": 5, "cnn_test": 8}
+# Séances par athlète (minutes, session_type) ; la fatigue dure
+# CNN_FATIGUE_MIN[fichier][k % len] minutes pour le k-ième athlète du fichier
+CNN_SESSIONS = [(3, "normal"), (8, "episodes"), (None, "fatigue"),
+                (3, "episodes_rares")]
+CNN_FATIGUE_MIN = {"cnn_train": [5, 6, 7, 8], "cnn_val": [5, 6, 7, 8],
+                   "cnn_test": [5, 8]}
+# Séance « episodes » : écart réduit entre épisodes et types à tour de rôle
+# (faux_pas 3 fois par cycle car très court)
+CNN_STRIDES_GAP = (12, 30)
+CNN_TYPE_CYCLE = ["instabilite", "faux_pas", "hyperextension", "faux_pas",
+                  "boiterie", "faux_pas"]
+# Séance « episodes_rares » : 3 faux pas pour 1 hyperextension, écart court
+# mais toujours >= FP_MIN_GAP foulées pour que chaque faux pas reste isolé
+FP_MIN_GAP = 6
+RARE_STRIDES_GAP = (FP_MIN_GAP, 13)
+RARE_TYPE_CYCLE = ["faux_pas", "faux_pas", "hyperextension", "faux_pas"]
+
+# Jeu de confirmation finale du prototype (cnn_test2) : nouveaux athlètes, générateur
+# séparé (graine + 2), appelé APRÈS tous les autres fichiers (qui restent identiques).
+# Jamais utilisé pour décider quoi que ce soit.
+CNN_TEST2_ATHLETES = 10
+CNN_TEST2_SESSIONS = [(4, "normal"), (4, "normal"), (8, "episodes"),
+                      (3, "episodes_rares"), (None, "fatigue")]
+CNN_TEST2_FATIGUE_MIN = [5, 8]
 
 
 def gauss(phi, mu, sig):
@@ -82,13 +115,17 @@ def plan_fatigue(n, rng, start_frac=0.25):
     return ["fatigue"] * n, s
 
 
-def plan_episodes(n, rng, n_ep=None, strides_gap=(25, 55)):
-    """Épisodes courts d'anomalies (instabilité, faux pas, ...) dans du normal."""
+def plan_episodes(n, rng, n_ep=None, strides_gap=(25, 55), type_cycle=None):
+    """Épisodes courts d'anomalies (instabilité, faux pas, ...) dans du normal.
+
+    type_cycle : itérateur de types (itertools.cycle) partagé entre séances
+    pour choisir les types à tour de rôle ; None = tirage au hasard.
+    """
     types = ["normal"] * n
     sev = np.zeros(n)
     i = int(rng.integers(40, 70))
     while i < n - 15:
-        t = TYPES[rng.integers(len(TYPES))]
+        t = next(type_cycle) if type_cycle is not None else TYPES[rng.integers(len(TYPES))]
         length = int(rng.integers(1, 3)) if t == "faux_pas" else int(rng.integers(10, 26))
         length = min(length, n - i)
         peak = rng.uniform(0.5, 1.0)
@@ -108,14 +145,15 @@ def plan_episodes(n, rng, n_ep=None, strides_gap=(25, 55)):
 # --------------------------------------------------------------------------
 # Génération d'une séance
 # --------------------------------------------------------------------------
-def simulate_session(ath, minutes, kind, rng, session_id, thermal_boost=1.0):
+def simulate_session(ath, minutes, kind, rng, session_id, thermal_boost=1.0,
+                     episodes_kw=None):
     n_strides = int(minutes * ath["cadence"] * 1.02) + 5
     if kind == "normal":
         types, sev = plan_normal(n_strides)
     elif kind == "fatigue":
         types, sev = plan_fatigue(n_strides, rng)
     elif kind == "episodes":
-        types, sev = plan_episodes(n_strides, rng)
+        types, sev = plan_episodes(n_strides, rng, **(episodes_kw or {}))
     else:
         raise ValueError(kind)
 
@@ -354,12 +392,121 @@ def main():
         add("test", a, 8, "fatigue")
         add("test", a, 5, "episodes")
 
+    files = {}
     for split, dfs in sess.items():
         df = pd.concat(dfs, ignore_index=True)
         df = df.drop(columns=["split"])
         path = f"{out}/dataset_{split}.csv"
-        df.to_csv(path, index=False)
+        write_csv(df, path)
         print(path, df.shape, f"anomalies={df['anomalie'].mean():.1%}")
+        files[f"dataset_{split}.csv"] = df
+
+    # ---- Jeux pour le CNN (classification du type) ----
+    # Générateur séparé, appelé APRÈS les 3 fichiers ci-dessus : ceux-ci restent
+    # identiques pour une même graine.
+    rng_cnn = np.random.default_rng(seed + 1)
+    next_id = len(athletes) + 1                # nouveaux athlètes : ids 27 et +
+    for split, n_ath in CNN_ATHLETES.items():
+        aths = [make_athlete(rng_cnn, next_id + i) for i in range(n_ath)]
+        next_id += n_ath
+        # Types à tour de rôle sur tout le fichier. faux_pas ne dure que 1-2
+        # foulées : il revient 3 fois par cycle pour en avoir assez.
+        kw = {"episodes": dict(strides_gap=CNN_STRIDES_GAP,
+                               type_cycle=itertools.cycle(CNN_TYPE_CYCLE)),
+              "episodes_rares": dict(strides_gap=RARE_STRIDES_GAP,
+                                     type_cycle=itertools.cycle(RARE_TYPE_CYCLE))}
+        fat_min = CNN_FATIGUE_MIN[split]
+        dfs = []
+        for k, a in enumerate(aths):
+            for minutes, stype in CNN_SESSIONS:
+                if stype == "fatigue":
+                    minutes = fat_min[k % len(fat_min)]
+                kind = "episodes" if stype == "episodes_rares" else stype
+                sid += 1
+                df = simulate_session(a, minutes, kind, rng_cnn, sid,
+                                      episodes_kw=kw.get(stype))
+                df["session_type"] = stype
+                dfs.append(df)
+        df = pd.concat(dfs, ignore_index=True)
+        check_isolated_faux_pas(df, split)
+        path = f"{out}/dataset_{split}.csv"
+        write_csv(df, path)
+        print(path, df.shape, f"anomalies={df['anomalie'].mean():.1%}")
+        files[f"dataset_{split}.csv"] = df
+
+    # ---- Jeu de confirmation finale (cnn_test2) ----
+    if CNN_TEST2_ATHLETES:
+        df = generer_cnn_test2(seed, sid, next_id)
+        path = f"{out}/dataset_cnn_test2.csv"
+        write_csv(df, path)
+        print(path, df.shape, f"anomalies={df['anomalie'].mean():.1%}")
+        files["dataset_cnn_test2.csv"] = df
+
+    print_summary(files)
+
+
+def generer_cnn_test2(seed, sid, next_id, n_athletes=None, sessions=None):
+    """10 NOUVEAUX athlètes (ids next_id et +), séances numérotées après sid.
+
+    Générateur aléatoire séparé (graine + 2) : les autres fichiers ne changent pas.
+    Même physique et même variabilité entre athlètes que les autres jeux.
+    """
+    rng = np.random.default_rng(seed + 2)
+    n_athletes = CNN_TEST2_ATHLETES if n_athletes is None else n_athletes
+    sessions = CNN_TEST2_SESSIONS if sessions is None else sessions
+    aths = [make_athlete(rng, next_id + i) for i in range(n_athletes)]
+    kw = {"episodes": dict(strides_gap=CNN_STRIDES_GAP,
+                           type_cycle=itertools.cycle(CNN_TYPE_CYCLE)),
+          "episodes_rares": dict(strides_gap=RARE_STRIDES_GAP,
+                                 type_cycle=itertools.cycle(RARE_TYPE_CYCLE))}
+    dfs = []
+    for k, a in enumerate(aths):
+        for minutes, stype in sessions:
+            if stype == "fatigue":
+                minutes = CNN_TEST2_FATIGUE_MIN[k % len(CNN_TEST2_FATIGUE_MIN)]
+            kind = "episodes" if stype == "episodes_rares" else stype
+            sid += 1
+            df = simulate_session(a, minutes, kind, rng, sid, episodes_kw=kw.get(stype))
+            df["session_type"] = stype
+            dfs.append(df)
+    df = pd.concat(dfs, ignore_index=True)
+    check_isolated_faux_pas(df, "cnn_test2")
+    return df
+
+
+def check_isolated_faux_pas(df, name, min_gap=FP_MIN_GAP):
+    """Échoue si un faux pas dure plus de 2 foulées ou si deux faux pas d'une
+    même séance sont séparés par moins de min_gap foulées (ils doivent rester
+    isolés)."""
+    st = df.groupby(["session_id", "stride_id"], sort=False)["etiquette"].first()
+    for sess, lab in st.groupby(level=0, sort=False):
+        fp = np.r_[False, lab.to_numpy() == "faux_pas", False].astype(int)
+        starts = np.flatnonzero(np.diff(fp) == 1)
+        ends = np.flatnonzero(np.diff(fp) == -1)     # exclus
+        if len(starts) and (ends - starts).max() > 2:
+            raise SystemExit(f"{name} : séance {sess}, faux pas de "
+                             f"{(ends - starts).max()} foulées (1 ou 2 attendues)")
+        gaps = starts[1:] - ends[:-1]
+        if len(gaps) and gaps.min() < min_gap:
+            raise SystemExit(f"{name} : séance {sess}, deux faux pas séparés par "
+                             f"{gaps.min()} foulées seulement (minimum {min_gap})")
+
+
+def write_csv(df, path):
+    # lineterminator fixé : sinon pandas écrit des fins de ligne CRLF sous
+    # Windows et les fichiers diffèrent selon la machine.
+    df.to_csv(path, index=False, lineterminator="\n")
+
+
+def print_summary(files):
+    print("\n===== Récapitulatif =====")
+    for name, df in files.items():
+        print(f"\n{name} : {len(df):,} lignes, {df['athlete_id'].nunique()} athlètes "
+              f"(ids {df['athlete_id'].min()}-{df['athlete_id'].max()}), "
+              f"{df['session_id'].nunique()} séances")
+        counts = df["etiquette"].value_counts()
+        for lab, c in counts.items():
+            print(f"    {lab:<15} {c:>8,}  {c / len(df):6.1%}")
 
 
 if __name__ == "__main__":
